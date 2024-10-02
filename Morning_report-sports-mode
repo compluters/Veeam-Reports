@@ -1,0 +1,417 @@
+#Key Improvements: from V1
+#Efficient Use of Lists (AddRange and Add vs +=):
+
+#Original Script: Used +=, which recreates the array every time an item is added. This is computationally expensive, especially for large datasets.
+#Optimized Script: Switched to List.AddRange() and List.Add(), which append items without recreating the array.
+
+#Morning Backup Report
+#
+
+function get-lastbackupjobs {
+    param([int]$lastHours)
+
+    $sessions = New-Object System.Collections.Generic.List[PSObject]
+
+    # Combine all sessions into a single query
+    $startTimeLimit = (get-date).AddHours(-$lastHours)
+
+    # Fetch VM backup sessions
+    $backupsJobs_VM = Get-VBRBackupSession -ea Stop | where { $_.EndTime -ge $startTimeLimit -or $_.State -eq 'Working' }
+    $backupsJobs_VM | ForEach-Object { $sessions.AddRange($_.GetTaskSessions()) }
+
+    # Fetch agent backup sessions
+    $backupsJobs_Agent = Get-VBRComputerBackupJobSession -ea Stop | where { $_.EndTime -ge $startTimeLimit -or $_.State -eq 'Working' }
+    $backupsJobs_Agent | Get-VBRTaskSession | where { $_.Name -notlike "*-CL*" } | ForEach-Object { $sessions.Add($_) }
+
+    # Fetch backup copy job sessions
+    $backupJobs_Copy = Get-VBRBackupCopyJob | ForEach-Object { Get-VBRSession -Job $_ } | where { $_.EndTime -ge $startTimeLimit -or $_.State -eq 'Working' }
+    $backupJobs_Copy | Get-VBRTaskSession | ForEach-Object { $sessions.Add($_) }
+
+    $jobDetails = New-Object System.Collections.Generic.List[PSCustomObject]
+
+    foreach ($session in $sessions) {
+        $duration = if ($session.Progress.Duration -eq $null) { 
+            '-' 
+        } elseif ($session.Progress.Duration.TotalMinutes -lt 60) { 
+            "$([math]::Ceiling($session.Progress.Duration.TotalMinutes)) min" 
+        } elseif ($session.Progress.Duration.TotalHours -lt 48) { 
+            "$([math]::Round($session.Progress.Duration.TotalHours,0)) hr" 
+        } else { 
+            "$([math]::Round($session.Progress.Duration.TotalDays,0)) days" 
+        }
+
+        $startTime = $session.Progress.StartTimeLocal.ToString('dd/MM/yyyy HH:mm')
+        $endTime = if ($session.Progress.StopTimeLocal -eq [datetime]::Parse('01/01/1900')) {
+            'N/A'
+        } else {
+            $session.Progress.StopTimeLocal.ToString('dd/MM/yyyy HH:mm')
+        }
+
+        $progress = if ($session.Status -eq "InProgress") {
+            "$([math]::Floor($session.Progress.ProcessedUsedSize * 100 / $session.Progress.TotalUsedSize))%"
+        } else {
+            "100%"
+        }
+
+        $info = ''
+        if ($session.Status -eq "Failed" -or $session.Status -eq "Warning") {
+            $info = $session.Info.Reason
+        }
+
+        $jobDetails.Add([PSCustomObject]@{
+            BackupJob = $session.JobName
+            Server = $session.Name.Split(' ')[0]
+            StartTime = $startTime
+            EndTime = $endTime
+            Duration = $duration
+            Status = $session.Status.ToString()
+            Progress = $progress
+            Info = $info
+        })
+    }
+
+    return $jobDetails
+}
+
+$lastHours = 24
+$jobDetails = get-lastbackupjobs -lastHours $lastHours
+
+$outputCsvPath = "backup_job_sport.csv"
+
+
+# Export the job details to a CSV file
+$jobDetails | Export-Csv -NoTypeInformation -Path $outputCsvPath -Encoding UTF8
+
+
+#######
+# Second half of script to convert csv to html
+
+
+### html parse from csv
+##########
+# Path to the CSV file
+$csvFilePath = "backup_job_sport.csv"
+
+# Path to save the HTML report
+$outputHtmlPath = "backup_report_sport.html"
+
+# Load CSV data
+$jobDetails = Import-Csv -Path $csvFilePath
+
+# Count jobs by status for summary table
+$totalSuccess = ($jobDetails | Where-Object { $_.Status -eq "Success" }).Count
+$totalFailed = ($jobDetails | Where-Object { $_.Status -eq "Failed" }).Count
+$totalWarning = ($jobDetails | Where-Object { $_.Status -eq "Warning" }).Count
+$totalJobs = $totalSuccess + $totalFailed + $totalWarning
+
+# Sort the jobs: Failed (Red) first, then Warning (Orange), then Success (Green)
+$sortedJobDetails = $jobDetails | Sort-Object { 
+    switch ($_.Status) {
+        "Failed" { 0 }
+        "Warning" { 1 }
+        "Success" { 2 }
+    }
+}
+
+# HTML Template with SVG logo integration
+$htmlTemplate = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Veeam Backup Job Morning Report</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
+        body {
+            font-family: 'Roboto', sans-serif;
+            background-color: #F0F0F0;  /* Light grey background */
+            color: #333;  /* Darker text for readability */
+            margin: 0;
+            padding: 20px;
+        }
+
+        /* Placeholder Logo and Tagline */
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px;
+            background-color: #e0e0e0;  /* Medium grey background for the header */
+            border-radius: 5px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+        }
+        .logo__img {
+            width: 180px;
+            height: auto;
+        }
+        .tagline {
+            font-size: 32px;
+            text-align: left;
+            color: #000000; /* Veeam Green for tagline */
+            font-weight: 700;
+        }
+
+        h1 {
+            text-align: center;
+            font-size: 26pt;
+            color: #00B140; /* Veeam green for the header */
+            margin-bottom: 10px;
+        }
+
+        .summary-container {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;  /* Align content evenly */
+            margin-bottom: 10px;
+        }
+
+        /* Table with green header and color-coded text */
+        .summary-table {
+            width: 60%;
+            border-collapse: collapse;
+            color: #333; /* Dark text */
+            font-size: 18pt; /* Increase font size for table */
+        }
+        .summary-table th {
+            background-color: #00B140; /* Green header background */
+            color: white; /* White text for contrast */
+            padding: 20px;
+            text-align: center;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+        .summary-table td {
+            padding: 20px;
+            border: 3px solid #ccc; /* Light border */
+            text-align: center;
+            border-radius: 5px;
+            font-weight: bold; /* Make the status text bold */
+            background-color: transparent; /* Ensure no background fill */
+        }
+        .summary-table td.success {
+            color: #00B140; /* Green text for success */
+        }
+        .summary-table td.failed {
+            color: #E53A40; /* Red text for failed */
+        }
+        .summary-table td.warning {
+            color: #F7941E; /* Orange text for warning */
+        }
+
+        .pie-chart {
+            width: 40%;  /* Adjust pie chart section size */
+            text-align: center;
+        }
+
+        canvas {
+            max-width: 320px;
+            max-height: 320px;
+            margin: 0 auto;
+        }
+
+        /* Grid for Job Tiles */
+        .grid-heading {
+            text-align: center;
+            font-size: 18px;
+            margin-bottom: 20px;
+            color: #333;
+        }
+        .grid-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 10px;
+            padding: 20px;
+        }
+        .grid-item {
+            padding: 20px;
+            border-radius: 5px;
+            color: #ffffff; /* White text for contrast */
+            text-align: center;
+            cursor: pointer;
+            transition: transform 0.3s ease, background-color 0.3s ease;
+        }
+        .grid-item:hover {
+            transform: translateY(-7px);
+        }
+        .grid-item h3 {
+            margin-bottom: 10px;
+            font-size: 18pt;
+        }
+        .grid-item p {
+            margin: 5px 0;
+        }
+        .grid-item .details {
+            display: none;
+            text-align: left;
+            margin-top: 10px;
+        }
+        .success {
+            background-color: #00B140; /* Green fill for success */
+        }
+        .failed {
+            background-color: #E53A40; /* Red fill for failed */
+        }
+        .warning {
+            background-color: #F7941E; /* Orange fill for warning */
+        }
+        .footer {
+            text-align: center;
+            margin-top: 40px;
+            background-color: #333333; /* Dark grey for footer */
+            color: #ffffff; /* White text for footer */
+            padding: 10px;
+            border-radius: 5px;
+        }
+        .footer a {
+            color: #00B140; /* Green link color */
+            text-decoration: none;
+        }
+        .footer a:hover {
+            text-decoration: underline;
+        }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+        function toggleDetails(id) {
+            var details = document.getElementById(id);
+            if (details.style.display === "none") {
+                details.style.display = "block";
+            } else {
+                details.style.display = "none";
+            }
+        }
+    </script>
+</head>
+<body>
+
+    <!-- Header with SVG Logo and Tagline -->
+    <div class="header">
+        <svg class="logo__img" viewBox="0 0 100 30" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <title>Veeam logo</title>
+            <path d="M8.46718 0.028021C7.57553 0.028021 6.7169 0.382384 6.08744 1.01125L0.98572 6.10009C0.35526 6.72896 0 7.58442 0 8.47382V30.0001L91.5869 29.9462C92.4785 29.9462 93.3371 29.5918 93.9666 28.9629L99.0113 23.931C99.6417 23.3021 99.997 22.4467 99.997 21.5573L100 0.0270233L8.46718 0.028021Z" fill="#00D15F"></path>
+            <path opacity="0.2" d="M0 10.6598L0.0100075 29.992L34.1749 29.972C34.1749 29.972 37.9727 30.1457 40.9259 29.4939C46.3528 28.2971 49.5842 26.0032 53.6241 21.9744C60.4391 15.1767 75.7013 0 75.7013 0L42.2869 0.00399348L19.2681 22.8698C19.2681 22.8698 17.797 24.5099 15.8085 24.5109C14.3215 24.5119 13.4708 23.912 12.362 22.8898C12.0378 22.5903 0 10.6688 0 10.6598Z" fill="white"></path>
+            <path d="M14.4966 22.2889L7.58752 7.89778H10.7018C10.7018 7.89778 15.6394 18.1992 15.7605 18.7213H15.8205C15.9446 18.1992 20.8792 7.89778 20.8792 7.89778H24.0235L17.1145 22.2889H14.4966Z" fill="white"></path>
+            <path d="M37.4043 16.1968H26.2151C26.6174 18.5336 28.3407 20.009 30.5623 20.009C32.3826 20.009 33.5825 19.3003 34.1989 17.9796H37.095C36.2304 20.7147 33.7366 22.5903 30.5583 22.5903C26.3652 22.5903 23.284 19.5478 23.284 15.0868C23.284 10.6598 26.3042 7.58334 30.5583 7.58334C34.35 7.58334 37.4633 10.8135 37.4633 15.0868C37.4653 15.5181 37.4653 15.7656 37.4043 16.1968ZM26.2451 13.859H34.5382C34.354 11.8896 32.7519 10.1707 30.5623 10.1707C28.3407 10.1677 26.6744 11.6161 26.2451 13.859Z" fill="white"></path>
+            <path d="M52.7545 16.1968H41.5643C41.9666 18.5336 43.6899 20.009 45.9115 20.009C47.7318 20.009 48.9317 19.3003 49.5481 17.9796H52.4443C51.5796 20.7147 49.0858 22.5903 45.9075 22.5903C41.7144 22.5903 38.6332 19.5478 38.6332 15.0868C38.6332 10.6598 41.6534 7.58334 45.9075 7.58334C49.6993 7.58334 52.8125 10.8135 52.8125 15.0868C52.8145 15.5181 52.8145 15.7656 52.7545 16.1968ZM41.5953 13.859H49.8884C49.7043 11.8896 48.1021 10.1707 45.9125 10.1707C43.6899 10.1677 42.0277 11.6161 41.5953 13.859Z" fill="white"></path>
+            <path d="M68.4459 15.0898V22.2859H65.9491L65.7009 20.0419C64.5911 21.7039 62.6507 22.5933 60.8904 22.5933C56.9446 22.5933 53.9544 19.457 53.9544 15.0898C53.9544 10.7866 57.1587 7.58633 61.2587 7.58633C65.0235 7.58633 68.4459 10.2915 68.4459 15.0898ZM65.6059 15.0898C65.6059 11.9235 63.5113 10.1717 61.2587 10.1717C58.7919 10.1717 56.7904 12.1411 56.7904 15.0898C56.7904 18.0425 58.6408 20.008 61.2587 20.008C63.4813 20.008 65.6059 18.1623 65.6059 15.0898Z" fill="white"></path>
+            <path d="M70.3564 22.2849V13.7692C70.3564 10.1717 72.669 7.59035 76.2767 7.59035C79.1728 7.59035 80.7149 9.52686 80.9331 10.2046H80.9931C81.2073 9.52886 82.7494 7.59035 85.6495 7.59035C89.2561 7.59035 91.5698 10.1717 91.5698 13.7692V22.2859H88.7338V13.9838C88.7338 11.647 87.685 10.2326 85.5595 10.2326C83.4309 10.2326 82.3851 11.647 82.3851 14.0447V22.3168H79.5491V14.0447C79.5491 11.647 78.5003 10.2326 76.3747 10.2326C74.2492 10.2326 73.2004 11.647 73.2004 13.9838V22.2859L70.3564 22.2849Z" fill="white"></path>
+        </svg>
+        <div class="tagline">Veeam Morning Backup Report</div>
+    </div>
+
+    <h1></h1>
+
+    <div class="summary-container">
+        <!-- Summary Table -->
+        <table class="summary-table">
+            <thead>
+                <tr>
+                    <th>Status</th>
+                    <th>Total</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td class="success">Success</td>
+                    <td>$totalSuccess</td>
+                </tr>
+                <tr>
+                    <td class="failed">Failed</td>
+                    <td>$totalFailed</td>
+                </tr>
+                <tr>
+                    <td class="warning">Warning</td>
+                    <td>$totalWarning</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <!-- Pie Chart -->
+        <div class="pie-chart">
+            <canvas id="statusPieChart"></canvas>
+        </div>
+    </div>
+
+    <!-- Grid Heading -->
+    <div class="grid-heading">
+        Backup Job Details
+    </div>
+
+    <!-- Grid for Job Details -->
+    <div class="grid-container">
+"@
+
+# Loop through each sorted job and add it to the HTML grid
+foreach ($job in $sortedJobDetails) {
+    $statusClass = ""
+    switch ($job.Status) {
+        "Success" { $statusClass = "success" }
+        "Failed" { $statusClass = "failed" }
+        "Warning" { $statusClass = "warning" }
+    }
+
+    # Generate unique ID for each job's details section
+    $uniqueId = "details-$([System.Guid]::NewGuid().ToString('N'))"
+
+    $htmlTemplate += @"
+        <div class='grid-item $statusClass' onclick='toggleDetails("$uniqueId")'>
+            <h3>$($job.BackupJob)</h3>
+            <p><strong>Status:</strong> $($job.Status)</p>
+            <div id='$uniqueId' class='details'>
+                <p><strong>Server:</strong> $($job.Server)</p>
+                <p><strong>Start:</strong> $($job.StartTime)</p>
+                <p><strong>End:</strong> $($job.EndTime)</p>
+                <p><strong>Info:</strong> $($job.Info)</p>
+            </div>
+        </div>
+"@
+}
+
+# Close HTML structure
+$htmlTemplate += @"
+    </div>
+    <div class='footer'>
+        Report generated on $(Get-Date -Format 'dd/MM/yyyy HH:mm') | <a href='#'>Veeam.com</a>
+    </div>
+
+    <script>
+        var ctx = document.getElementById('statusPieChart').getContext('2d');
+        var statusPieChart = new Chart(ctx, {
+            type: 'pie',
+            data: {
+                labels: ['Success', 'Failed', 'Warning'],
+                datasets: [{
+                    data: [$totalSuccess, $totalFailed, $totalWarning],
+                    backgroundColor: ['#00B140', '#E53A40', '#F7941E'],
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    legend: {
+                        position: 'bottom',
+                        labels: {
+                            color: '#333',
+                            font: {
+                                family: 'Roboto',
+                                size: 14
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    </script>
+
+</body>
+</html>
+"@
+
+# Output the HTML report
+$htmlTemplate | Out-File -FilePath $outputHtmlPath -Encoding UTF8
+
+Write-Host "Morning Backup report has been generated: $outputHtmlPath"
+ 
